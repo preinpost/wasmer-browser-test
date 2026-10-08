@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>wasmer-test — feat/browser-ingest-wasmer 검증</title>
+<link rel="stylesheet" href="/vendor/@xterm/xterm/css/xterm.css" />
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0d1117; color: #c9d1d9;
+    font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    padding: 24px;
+  }
+  h1 { font-size: 16px; color: #e6edf3; margin: 0 0 4px; }
+  .sub { color: #8b949e; margin: 0 0 16px; font-size: 12px; }
+  .bar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }
+  button {
+    background: #238636; color: #fff; border: 0; border-radius: 6px;
+    padding: 8px 16px; font: inherit; cursor: pointer;
+  }
+  button:disabled { background: #21262d; color: #6e7681; cursor: not-allowed; }
+  button.danger { background: #b62324; }
+  button.ghost { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+  button.ghost.active { background: #388bfd; border-color: #388bfd; color: #fff; }
+  input, select {
+    background: #0d1117; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 6px; padding: 7px 10px; font: inherit;
+  }
+  #wisp { width: 280px; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid #30363d; color: #8b949e; }
+  .badge.ok { color: #3fb950; border-color: #238636; }
+  .badge.bad { color: #f85149; border-color: #f85149; }
+  .badge.warn { color: #d29922; }
+  #term, #tty {
+    background: #010409; border: 1px solid #30363d; border-radius: 8px;
+  }
+  #term {
+    padding: 14px; height: calc(100vh - 190px); overflow: auto; white-space: pre-wrap;
+    word-break: break-all; font-size: 12.5px; line-height: 1.55;
+  }
+  #tty { height: calc(100vh - 190px); padding: 6px; }
+  .pass { color: #3fb950; } .fail { color: #f85149; } .dim { color: #6e7681; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <h1>wasmer-test <span class="dim">— feat/browser-ingest-wasmer 브랜치 체인 검증</span></h1>
+  <p class="sub">
+    브랜치와 동일한 버전: @wasmer/sdk@0.19.1 · python@=3.13.20 · quickjs@=0.15.1 · ffmpeg@=1.0.5 · yt-dlp==2026.8.19<br />
+    브라우저 안의 WASIX에서 직접 실행합니다. yt-dlp 단계는 TCP 중계가 필요해서 아래 WISP 프록시를 씁니다.
+  </p>
+
+  <div class="bar">
+    <button id="tabTest" class="ghost active">체인 검증</button>
+    <button id="tabTty" class="ghost">대화형 TTY</button>
+    <span style="flex:1"></span>
+    <input id="wisp" value="ws://127.0.0.1:5001/" spellcheck="false" title="WISP 프록시 주소 (serve.mjs가 5001에서 띄움)" />
+    <span class="badge" id="iso">격리 확인 중…</span>
+    <span class="badge" id="wispState">WISP 미확인</span>
+  </div>
+
+  <!-- 모드 1: 체인 검증 (기존 one-shot) -->
+  <div id="paneTest">
+    <div class="bar"><button id="run">실행</button></div>
+    <div id="term" aria-live="polite"></div>
+  </div>
+
+  <!-- 모드 2: 대화형 TTY -->
+  <div id="paneTty" class="hidden">
+    <div class="bar">
+      <select id="ttyProg">
+        <option value="bash">bash</option>
+        <option value="python">python (REPL)</option>
+        <option value="qjs">qjs (QuickJS REPL)</option>
+        <option value="ffmpeg">ffmpeg (인자 없이 시작)</option>
+      </select>
+      <button id="ttyStart">시작</button>
+      <button id="ttyStop" class="danger" disabled>종료 (SIGKILL)</button>
+      <span class="dim" id="ttyHint">시작 후 아래 터미널에 직접 입력하세요. Ctrl+C도 게스트로 전달됩니다.</span>
+    </div>
+    <div id="tty"></div>
+  </div>
+
+<script type="importmap">
+  {
+    "imports": {
+      "@wasmer/sdk/browser": "/vendor/@wasmer/sdk/dist/index.js",
+      "@mercuryworkshop/wisp-js/client": "/vendor/@mercuryworkshop/wisp-js/src/entrypoints/client.mjs",
+      "@xterm/xterm": "/vendor/@xterm/xterm/lib/xterm.mjs",
+      "@xterm/addon-fit": "/vendor/@xterm/addon-fit/lib/addon-fit.mjs"
+    }
+  }
+</script>
+<script type="module">
+  const term = document.getElementById("term");
+  const runBtn = document.getElementById("run");
+  const wispInput = document.getElementById("wisp");
+  const PACKAGES = {
+    python: "python/python@=3.13.20",
+    quickjs: "wasmer/quickjs@=0.15.1",
+    ffmpeg: "wasmer/ffmpeg@=1.0.5",
+  };
+  // 프로그램 이름 → 속한 패키지. python 패키지에 bash와 coreutils가 통째로 들어 있다.
+  const PROGRAM_PACKAGE = { bash: PACKAGES.python, python: PACKAGES.python, qjs: PACKAGES.quickjs, ffmpeg: PACKAGES.ffmpeg };
+
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const write = (html) => { term.insertAdjacentHTML("beforeend", html); term.scrollTop = term.scrollHeight; };
+  const writeText = (t) => write(esc(t));
+  const pass = (t) => write(`<span class="pass">PASS</span> ${esc(t)}\n`);
+  const fail = (t) => write(`<span class="fail">FAIL</span> ${esc(t)}\n`);
+  const dim = (t) => write(`<span class="dim">${esc(t)}</span>\n`);
+
+  // ---- 모드 전환 -------------------------------------------------------------
+
+  const paneTest = document.getElementById("paneTest");
+  const paneTty = document.getElementById("paneTty");
+  const tabTest = document.getElementById("tabTest");
+  const tabTty = document.getElementById("tabTty");
+  function switchTab(toTty) {
+    paneTest.classList.toggle("hidden", toTty);
+    paneTty.classList.toggle("hidden", !toTty);
+    tabTest.classList.toggle("active", !toTty);
+    tabTty.classList.toggle("active", toTty);
+    if (toTty) ttyResize();
+  }
+  tabTest.addEventListener("click", () => switchTab(false));
+  tabTty.addEventListener("click", () => switchTab(true));
+
+  // ---- 상태 배지 -------------------------------------------------------------
+
+  const isoBadge = document.getElementById("iso");
+  if (!globalThis.isSecureContext || !globalThis.crossOriginIsolated || typeof SharedArrayBuffer === "undefined") {
+    isoBadge.textContent = "격리 실패 — COOP/COEP 헤더 확인";
+    isoBadge.className = "badge bad";
+    fail("crossOriginIsolated=false. file://로 열면 안 되고 node serve.mjs로 접속해야 합니다.");
+  } else {
+    isoBadge.textContent = "격리 OK (SharedArrayBuffer)";
+    isoBadge.className = "badge ok";
+  }
+
+  const wispBadge = document.getElementById("wispState");
+  async function checkWisp(url) {
+    wispBadge.textContent = "WISP 확인 중…"; wispBadge.className = "badge";
+    try {
+      const res = await fetch(url.replace(/^ws/, "http"), { signal: AbortSignal.timeout(3000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      wispBadge.textContent = "WISP OK";
+      wispBadge.className = "badge ok";
+      return true;
+    } catch {
+      wispBadge.textContent = "WISP 없음 (yt-dlp 단계 생략)";
+      wispBadge.className = "badge warn";
+      return false;
+    }
+  }
+  checkWisp(wispInput.value.trim());
+  wispInput.addEventListener("change", () => checkWisp(wispInput.value.trim()));
+
+  // ---- 모드 1: 체인 검증 ------------------------------------------------------
+
+  function excerpt(text, maxLines = 10) {
+    const lines = text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").split("\n").filter((l) => l.trim());
+    if (!lines.length) return dim("(출력 없음)");
+    writeText(lines.slice(0, maxLines).map((l) => "  " + l).join("\n") + "\n");
+    if (lines.length > maxLines) dim(`  … 외 ${lines.length - maxLines}줄`);
+  }
+
+  async function runStep(title, fn) {
+    write(`\n== ${esc(title)} ==\n`);
+    const t0 = performance.now();
+    try {
+      const note = await fn();
+      pass(`${title} (${((performance.now() - t0) / 1000).toFixed(1)}s)${note ? ` — ${note}` : ""}`);
+      return true;
+    } catch (error) {
+      fail(`${title} (${((performance.now() - t0) / 1000).toFixed(1)}s)`);
+      dim(String(error?.stack || error));
+      return false;
+    }
+  }
+
+  async function runIn(sandbox, name, args, opts = {}) {
+    dim(`  $ ${name} ${args.join(" ")}`);
+    const out = await sandbox.command(name, args, { cwd: "/workspace", ...opts.cmd }).run({
+      timeoutMs: opts.timeoutMs ?? 60_000, outputBytes: 256 * 1024, check: false,
+    });
+    dim(`  exit: ${out.exitCode} (${out.reason})`);
+    excerpt(out.stdout?.text() ?? "");
+    const err = out.stderr?.text() ?? "";
+    if (err.trim()) { dim("  [stderr]"); excerpt(err, 4); }
+    if (!out.ok) throw new Error(`${name} 종료 코드 ${out.exitCode}`);
+    return out;
+  }
+
+  let sharedWasmer;
+  async function getWasmer() {
+    if (!sharedWasmer) {
+      const { Wasmer } = await import("@wasmer/sdk/browser");
+      sharedWasmer = new Wasmer({ parallelism: 2, cache: { namespace: "wasmer-test-v1" } });
+      await sharedWasmer.ready();
+    }
+    return sharedWasmer;
+  }
+
+  runBtn.addEventListener("click", async () => {
+    runBtn.disabled = true;
+    term.textContent = "";
+    const results = [];
+    const record = (title, ok) => results.push({ title, ok });
+    try {
+      const wasmer = await getWasmer();
+
+      const commandNames = {};
+      for (const [label, source] of Object.entries(PACKAGES)) {
+        const ok = await runStep(`패키지 로드: ${source}`, async () => {
+          const pkg = await wasmer.packages.load(source);
+          commandNames[label] = pkg.commands;
+          const interesting = ["python", "pip", "qjs", "quickjs", "ffmpeg", "ffprobe", "bash", "sh"].filter((c) => pkg.commands.includes(c));
+          return `entrypoint: ${pkg.entrypoint}, commands: ${interesting.join(", ")} 외 ${pkg.commands.length}개`;
+        });
+        record(`패키지 로드: ${source}`, ok);
+      }
+
+      if (commandNames.quickjs) {
+        record("QuickJS 실행", await runStep("QuickJS 실행", async () => {
+          const sandbox = await wasmer.sandboxes.create({
+            packages: [PACKAGES.quickjs],
+            files: { "hello.js": `print("hello from quickjs", 1 + 2);\n` },
+          });
+          try { await runIn(sandbox, "qjs", ["/workspace/hello.js"]); } finally { await sandbox.close(); }
+        }));
+      }
+
+      if (commandNames.python) {
+        record("Python 실행", await runStep("Python 실행 (--version)", async () => {
+          const sandbox = await wasmer.sandboxes.create({ packages: [PACKAGES.python] });
+          try { await runIn(sandbox, "python", ["--version"]); } finally { await sandbox.close(); }
+        }));
+      }
+
+      if (commandNames.ffmpeg) {
+        record("FFmpeg 실행", await runStep("FFmpeg 실행 (-version)", async () => {
+          const sandbox = await wasmer.sandboxes.create({ packages: [PACKAGES.ffmpeg] });
+          try { await runIn(sandbox, "ffmpeg", ["-version"]); } finally { await sandbox.close(); }
+        }));
+      }
+
+      const wispUrl = wispInput.value.trim();
+      const wispOk = wispUrl ? await checkWisp(wispUrl) : false;
+      if (wispOk && commandNames.python) {
+        record("yt-dlp 설치+실행", await runStep(`yt-dlp 설치·실행 (WISP: ${wispUrl})`, async () => {
+          const sandbox = await wasmer.sandboxes.create({
+            packages: [PACKAGES.python],
+            network: { mode: "wisp", url: wispUrl },
+          });
+          try {
+            await runIn(sandbox, "python",
+              ["-m", "pip", "install", "--disable-pip-version-check", "--no-input", "--no-cache-dir",
+                "--target", "/workspace/.python-packages", "yt-dlp==2026.8.19"],
+              { timeoutMs: 180_000 });
+            await runIn(sandbox, "python", ["-m", "yt_dlp", "--version"],
+              { cmd: { env: { PYTHONPATH: "/workspace/.python-packages" } } });
+            await runIn(sandbox, "python", ["-m", "yt_dlp", "--help"],
+              { cmd: { env: { PYTHONPATH: "/workspace/.python-packages" } } });
+          } finally { await sandbox.close(); }
+        }));
+      }
+    } catch (error) {
+      fail("초기화 실패");
+      dim(String(error?.stack || error));
+    } finally {
+      write("\n== 요약 ==\n");
+      for (const r of results) r.ok ? pass(r.title) : fail(r.title);
+      const failed = results.filter((r) => !r.ok).length;
+      write(`\n${results.length - failed}/${results.length} 통과${failed ? `, ${failed}개 실패` : ""}\n`);
+      runBtn.disabled = false;
+    }
+  });
+
+  // ---- 모드 2: 대화형 TTY -----------------------------------------------------
+
+  const { Terminal } = await import("@xterm/xterm");
+  const { FitAddon } = await import("@xterm/addon-fit");
+
+  const xterm = new Terminal({
+    convertEol: true,
+    cursorBlink: true,
+    fontSize: 13,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    theme: { background: "#010409", foreground: "#c9d1d9" },
+  });
+  const fit = new FitAddon();
+  xterm.loadAddon(fit);
+  xterm.open(document.getElementById("tty"));
+  fit.fit();
+
+  const ttyStart = document.getElementById("ttyStart");
+  const ttyStop = document.getElementById("ttyStop");
+  const ttyHint = document.getElementById("ttyHint");
+  let ttySandbox;
+  let ttyProc;
+
+  function ttyResize() { try { fit.fit(); } catch {} }
+  window.addEventListener("resize", () => {
+    if (paneTty.classList.contains("hidden")) return;
+    ttyResize();
+    ttyProc?.resizeTerminal(xterm.cols, xterm.rows);
+  });
+
+  async function pump(readerLike, sink) {
+    if (!readerLike) return;
+    try { for await (const chunk of readerLike) sink(chunk); } catch { /* 종료 시 정상 흐름 */ }
+  }
+
+  ttyStart.addEventListener("click", async () => {
+    const name = document.getElementById("ttyProg").value;
+    ttyStart.disabled = true;
+    ttyStop.disabled = false;
+    xterm.reset();
+    xterm.writeln(`\x1b[2mwasmer-test: ${name} 시작 (WASIX 샌드박스, 패키지 ${PROGRAM_PACKAGE[name]})\x1b[0m`);
+    try {
+      const wasmer = await getWasmer();
+      ttySandbox = await wasmer.sandboxes.create({
+        packages: [PROGRAM_PACKAGE[name]],
+        // 공식 wasmer-sh 데모와 동일한 환경. TERM이 없으면 python pyrepl이
+        // terminfo를 못 찾고, tty 에코·개행 처리도 어긋난다.
+        env: {
+          HOME: "/workspace",
+          PATH: "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.",
+          USER: "wasmer",
+          LOGNAME: "wasmer",
+          TERM: "xterm-256color",
+          COLORTERM: "truecolor",
+        },
+      });
+      const args = name === "bash" ? ["-i"] : [];
+      ttyProc = await ttySandbox.command(name, args, { cwd: "/workspace" }).spawn({
+        terminal: { columns: xterm.cols, rows: xterm.rows },
+        outputBytes: 1024 * 1024,
+      });
+      ttyHint.textContent = `${name} 실행 중 (pid ${ttyProc.id}) — 종료 버튼 또는 Ctrl+C`;
+      pump(ttyProc.stdout, (b) => xterm.write(b));
+      pump(ttyProc.stderr, (b) => xterm.write(b));
+      ttyProc.stdin?.write(""); // stdin 준비
+      xterm.focus();
+      const out = await ttyProc.wait();
+      xterm.writeln(`\r\n\x1b[2m[${name} 종료: code ${out.exitCode} (${out.reason})]\x1b[0m`);
+    } catch (error) {
+      xterm.writeln(`\r\n\x1b[31m시작 실패: ${String(error?.message || error)}\x1b[0m`);
+    } finally {
+      await ttySandbox?.close().catch(() => {});
+      ttySandbox = undefined;
+      ttyProc = undefined;
+      ttyStart.disabled = false;
+      ttyStop.disabled = true;
+      ttyHint.textContent = "종료됨. 프로그램을 골라 다시 시작하세요.";
+    }
+  });
+
+  ttyStop.addEventListener("click", () => { ttyProc?.terminate({ gracePeriodMs: 1500 }).catch(() => ttyProc?.kill()); });
+
+  // 키 입력 → 게스트 stdin (Ctrl+C 포함 원문 전달)
+  xterm.onData((data) => { ttyProc?.stdin?.write(data).catch(() => {}); });
+</script>
+</body>
+</html>
